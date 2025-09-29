@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+LC_ALL=C
+
+# ========= 可配置区域（也可通过外部策略文件覆盖，见注释） =========
+# 1) 敏感词（用于 commit message 与注释行）
+#    - 默认：常见中英文关键词 + 常见 AKIA/私钥头
+DEFAULT_SENSITIVE_PATTERN='密钥|密码|口令|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+
+# 2) 禁止的扩展名（正则，结尾匹配）
+DEFAULT_DENY_EXT_REGEX='\.((docx)|(zip)|(gz)|(7z)|(rar)|(tar)|(tgz)|(jar)|(war))$'
+
+# 3) 注释行识别（针对“新增的行”）
+#    识别常见注释前缀：#, //, /*, *, --, ;, <!--, """ , '''
+COMMENT_PREFIX_REGEX='^\+\s*(#|//|/\*|\*|--|;|<!--|"""|'"'"'""|'"'"')'
+
+# 4) 可选的策略文件（若存在则覆盖默认）
+POLICY_DIR="/etc/gitlab/push-policy"
+KEYWORDS_FILE="${POLICY_DIR}/sensitive_keywords.txt"   # 每行一个正则/词；自动 -f 读入
+DENY_EXT_FILE="${POLICY_DIR}/deny_extensions.txt"       # 每行一个扩展名（不带点），自动拼成正则
+PATH_IGNORE_FILE="${POLICY_DIR}/path_ignore_globs.txt"  # 每行一个glob，匹配则跳过扫描（如 vendor/**）
+
+# ========= 内部函数 =========
+die() { echo "GL-HOOK-ERR: $*" >&2; exit 1; }
+
+build_deny_ext_regex() {
+  if [[ -s "$DENY_EXT_FILE" ]]; then
+    local joined ext
+    joined="$(tr -s '\r\n' '\n' <"$DENY_EXT_FILE" | grep -Ev '^\s*(#|$)' | paste -sd'|' -)"
+    [[ -n "${joined:-}" ]] && echo "\\.(${joined})$" || echo "$DEFAULT_DENY_EXT_REGEX"
+  else
+    echo "$DEFAULT_DENY_EXT_REGEX"
+  fi
+}
+
+path_ignored() {
+  local p="$1"
+  [[ -s "$PATH_IGNORE_FILE" ]] || return 1
+  while IFS= read -r pattern; do
+    [[ -z "$pattern" || "$pattern" =~ ^\s*# ]] && continue
+    # 使用bash的glob匹配
+    if [[ "$p" == $pattern ]]; then return 0; fi
+  done < <(tr -d '\r' < "$PATH_IGNORE_FILE")
+  return 1
+}
+
+grep_sensitive() {
+  # 使用文件列表或默认模式匹配（忽略大小写）
+  if [[ -s "$KEYWORDS_FILE" ]]; then
+    grep -Ei -f "$KEYWORDS_FILE"
+  else
+    grep -Ei "$DEFAULT_SENSITIVE_PATTERN"
+  fi
+}
+
+check_commit_message() {
+  local commit="$1" msg
+  msg="$(git log -1 --pretty=%B "$commit")" || return 0
+  if printf '%s' "$msg" | grep_sensitive >/dev/null; then
+    die "提交信息包含敏感词（commit: $commit）"
+  fi
+}
+
+deny_extensions() {
+  local path="$1" regex="$2"
+  if echo "$path" | grep -Eq "$regex"; then
+    die "禁止提交此类文件：$path"
+  fi
+}
+
+scan_added_comment_lines() {
+  local commit="$1" path="$2"
+  # 仅看“新增的行”，并过滤出“看起来是注释的新增行”
+  # 排除 diff 头部的 '+++'
+  if git diff -U0 "${commit}^" "$commit" -- "$path" \
+      | grep -E '^\+[^+]' \
+      | grep -E "$COMMENT_PREFIX_REGEX" \
+      | sed -E 's/^\+//' \
+      | grep_sensitive >/dev/null; then
+    die "在注释中发现敏感词：$path @ $commit"
+  fi
+}
+
+check_commit() {
+  local commit="$1" deny_ext_regex="$2"
+  # 1) commit message
+  check_commit_message "$commit"
+
+  # 2) 遍历该 commit 的变更文件（新增/修改/复制/重命名）
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    # 忽略某些路径（如果配置了）
+    if path_ignored "$path"; then
+      continue
+    fi
+    # 2.1 扩展名黑名单
+    deny_extensions "$path" "$deny_ext_regex"
+
+    # 2.2 仅扫描文本文件的“新增注释行”
+    #     - 二进制diff不会出现以'+'开头的内容行；这里按新增行+注释前缀筛选
+    scan_added_comment_lines "$commit" "$path"
+  done < <(git diff-tree --no-commit-id --name-only -r --diff-filter=ACMR "$commit")
+}
+
+# ========= 主逻辑 =========
+DENY_EXT_REGEX="$(build_deny_ext_regex)"
+
+# 读取 stdin 的多行: oldrev newrev refname
+while read -r oldrev newrev refname; do
+  # 分支删除（newrev 为 000...）不处理
+  if [[ "$newrev" =~ ^0{40}$ ]]; then
+    continue
+  fi
+  # 遍历此次 push 引入的所有非合并提交
+  while read -r commit; do
+    check_commit "$commit" "$DENY_EXT_REGEX"
+  done < <(git rev-list --no-merges "${oldrev}..${newrev}")
+done
+
+exit 0
