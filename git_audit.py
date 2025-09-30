@@ -63,6 +63,8 @@ def get(url, params=None, stream=False):
     r.raise_for_status()
 
 def iter_projects():
+    """获取所有项目，同时返回项目总数用于进度条"""
+    projects = []
     page = 1
     while True:
         r = get(f"{BASE}/api/v4/projects", params={
@@ -71,9 +73,9 @@ def iter_projects():
         })
         items = r.json()
         if not items: break
-        for p in items:
-            yield p
+        projects.extend(items)
         page += 1
+    return projects
 
 def list_tree(proj_id: int, ref: str):
     page = 1
@@ -175,13 +177,56 @@ def scan_comment_lines(ext: str, text: str) -> List[Tuple[int, str]]:
 
     return hits
 
+def init_csv_files():
+    """初始化CSV文件，写入表头"""
+    # 初始化二进制文件CSV
+    with open("binary_hits.csv", "w", newline="", encoding="utf-8") as f:
+        cw = csv.writer(f)
+        cw.writerow(["project_id","project","branch","file_path"])
+    
+    # 初始化注释敏感词CSV
+    with open("comment_hits.csv", "w", newline="", encoding="utf-8") as f:
+        cw = csv.writer(f)
+        cw.writerow(["project_id","project","branch","file_path","line","keyword","comment_excerpt"])
+
+def append_to_binary_csv(rows):
+    """追加二进制文件记录到CSV"""
+    if not rows:
+        return
+    with open("binary_hits.csv", "a", newline="", encoding="utf-8") as f:
+        cw = csv.writer(f)
+        cw.writerows(rows)
+
+def append_to_comment_csv(rows):
+    """追加注释敏感词记录到CSV"""
+    if not rows:
+        return
+    with open("comment_hits.csv", "a", newline="", encoding="utf-8") as f:
+        cw = csv.writer(f)
+        cw.writerows(rows)
+
 def main():
-    bin_rows = []
-    comment_rows = []
-    for p in iter_projects():
+    # 初始化CSV文件
+    init_csv_files()
+    
+    # 获取所有项目
+    print("正在获取项目列表...")
+    projects = iter_projects()
+    total_projects = len(projects)
+    print(f"找到 {total_projects} 个项目，开始扫描...")
+    
+    total_binary_hits = 0
+    total_comment_hits = 0
+    
+    # 逐个处理项目并显示进度
+    for idx, p in enumerate(projects, 1):
         pid = p["id"]
         full = p.get("path_with_namespace") or p.get("name")
         ref = p.get("default_branch") or "main"
+        
+        # 显示当前进度
+        print(f"[{idx}/{total_projects}] 正在扫描项目: {full}")
+        
         # 如果没有默认分支，尝试 master；再不行就跳过
         if not ref:
             ref = "main"
@@ -196,8 +241,12 @@ def main():
             try:
                 tree = list(list_tree(pid, ref))
             except Exception:
-                print(f"[跳过] {full}: 无默认分支/无法读取树")
+                print(f"  [跳过] {full}: 无默认分支/无法读取树")
                 continue
+
+        # 当前项目的记录
+        project_bin_rows = []
+        project_comment_rows = []
 
         for node in tree:
             if node.get("type") != "blob":
@@ -209,7 +258,7 @@ def main():
             low = path.lower()
             # 检查是否为二进制文件
             if any(low.endswith(ext) for ext in BINARY_EXTS):
-                bin_rows.append([pid, full, ref, path])
+                project_bin_rows.append([pid, full, ref, path])
                 continue
 
             ext = ext_of(path)
@@ -232,23 +281,27 @@ def main():
             for (lineno, excerpt) in hits:
                 # 找到匹配的具体词（用于报告）
                 matched = next((w for w in WORDS if re.search(re.escape(w), excerpt, re.IGNORECASE)), "")
-                comment_rows.append([pid, full, ref, path, lineno, matched, excerpt])
+                project_comment_rows.append([pid, full, ref, path, lineno, matched, excerpt])
 
+        # 每处理完一个项目就写入CSV
+        append_to_binary_csv(project_bin_rows)
+        append_to_comment_csv(project_comment_rows)
+        
+        # 更新统计并显示当前项目结果
+        total_binary_hits += len(project_bin_rows)
+        total_comment_hits += len(project_comment_rows)
+        
+        if project_bin_rows or project_comment_rows:
+            print(f"  -> 发现: 二进制文件 {len(project_bin_rows)} 个, 敏感注释 {len(project_comment_rows)} 条")
+        else:
+            print(f"  -> 无发现")
+        
         # 对 API 客气一点
-        time.sleep(0.2)
+        time.sleep(0.1)
 
-    # 输出 CSV
-    with open("binary_hits.csv", "w", newline="", encoding="utf-8") as f:
-        cw = csv.writer(f)
-        cw.writerow(["project_id","project","branch","file_path"])
-        cw.writerows(bin_rows)
-
-    with open("comment_hits.csv", "w", newline="", encoding="utf-8") as f:
-        cw = csv.writer(f)
-        cw.writerow(["project_id","project","branch","file_path","line","keyword","comment_excerpt"])
-        cw.writerows(comment_rows)
-
-    print(f"完成：发现二进制文件 {len(bin_rows)} 条，注释敏感词 {len(comment_rows)} 条。")
+    print(f"\n扫描完成！")
+    print(f"总计发现二进制文件：{total_binary_hits} 条")
+    print(f"总计发现注释敏感词：{total_comment_hits} 条")
     print("结果文件：binary_hits.csv, comment_hits.csv")
 
 if __name__ == "__main__":
