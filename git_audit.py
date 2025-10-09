@@ -26,16 +26,42 @@ HEADERS = {
     "Authorization": f"Bearer {TOKEN}",  # 兼容 Bearer
 }
 
-# 你可以通过环境变量自定义敏感词；默认提供一份通用清单（中英文）
-raw_words = os.environ.get("SENSITIVE_WORDS", "")
-if raw_words.strip():
-    WORDS = [w.strip() for w in raw_words.split(",") if w.strip()]
-else:
-    WORDS = ["密码","密钥","私钥","机密","仅限内部","敏感","secret","token","password",
-             "access_key","api_key","client_secret","credential","confidential"]
+# 你可以通过环境变量自定义敏感词；支持正则表达式和普通字符串混合（中英文）
+# 格式：SENSITIVE_WORDS="密码,secret,regex:(?:api[_-]?key|access[_-]?token)"
+# 使用 "regex:" 前缀表示正则表达式，其他为普通字符串
+def parse_sensitive_words():
+    """解析敏感词配置，支持正则表达式和普通字符串混合"""
+    raw_words = os.environ.get("SENSITIVE_WORDS", "")
+    if raw_words.strip():
+        words = [w.strip() for w in raw_words.split(",") if w.strip()]
+    else:
+        words = ["secret","password",
+                 "access_key","api_key","client_secret","credential","confidential","regex:.*ok.*"]
+    
+    patterns = []
+    word_list = []  # 用于记录原始词汇（用于报告）
+    
+    for word in words:
+        if word.startswith("regex:"):
+            # 正则表达式模式
+            regex_pattern = word[6:]  # 去掉 "regex:" 前缀
+            try:
+                patterns.append(re.compile(regex_pattern, re.IGNORECASE))
+                word_list.append(f"regex:{regex_pattern}")
+            except re.error as e:
+                print(f"警告：无效的正则表达式 '{regex_pattern}': {e}", file=sys.stderr)
+                # 如果正则无效，按普通字符串处理
+                patterns.append(re.compile(re.escape(regex_pattern), re.IGNORECASE))
+                word_list.append(regex_pattern)
+        else:
+            # 普通字符串，需要转义
+            patterns.append(re.compile(re.escape(word), re.IGNORECASE))
+            word_list.append(word)
+    
+    return patterns, word_list
 
-# 编译为大小写不敏感的正则
-WORD_PATTERNS = [re.compile(re.escape(w), re.IGNORECASE) for w in WORDS]
+# 解析敏感词配置
+WORD_PATTERNS, WORDS = parse_sensitive_words()
 
 # 需要扫描注释的代码扩展名（可按需扩充）
 C_LIKE = {"c","h","hpp","hh","cpp","cc","cxx","java","js","jsx","ts","tsx","go","php","kt","kts","scala","rs","swift","css","scss"}
@@ -118,7 +144,7 @@ def in_skip_dir(path: str) -> bool:
     parts = path.split("/")
     return any(part.lower() in SKIP_DIRS for part in parts[:-1])
 
-def scan_comment_lines(ext: str, text: str) -> List[Tuple[int, str]]:
+def scan_comment_lines(ext: str, text: str) -> List[Tuple[int, str, str]]:
     hits = []
     lines = text.splitlines()
     in_block = False
@@ -169,11 +195,13 @@ def scan_comment_lines(ext: str, text: str) -> List[Tuple[int, str]]:
             seg = comment_segment.strip()
             if not seg: 
                 continue
-            for pat in WORD_PATTERNS:
+            for i, pat in enumerate(WORD_PATTERNS):
                 if pat.search(seg):
                     # 收敛一下行内容，避免 CSV 太长
                     excerpt = seg[:240]
-                    hits.append((idx, excerpt))
+                    # 获取对应的原始词汇用于报告
+                    matched_word = WORDS[i]
+                    hits.append((idx, matched_word, excerpt))
                     break
 
     return hits
@@ -209,12 +237,11 @@ def scan_commit_message(message: str) -> List[str]:
     if not message:
         return hits
     
-    for pat in WORD_PATTERNS:
+    for i, pat in enumerate(WORD_PATTERNS):
         if pat.search(message):
-            # 找到匹配的具体词
-            matched = next((w for w in WORDS if re.search(re.escape(w), message, re.IGNORECASE)), "")
-            if matched:
-                hits.append(matched)
+            # 获取对应的原始词汇用于报告
+            matched_word = WORDS[i]
+            hits.append(matched_word)
     
     return list(set(hits))  # 去重
 
@@ -334,10 +361,8 @@ def main():
                 continue
 
             hits = scan_comment_lines(ext, text)
-            for (lineno, excerpt) in hits:
-                # 找到匹配的具体词（用于报告）
-                matched = next((w for w in WORDS if re.search(re.escape(w), excerpt, re.IGNORECASE)), "")
-                project_comment_rows.append([pid, full, ref, path, lineno, matched, excerpt])
+            for (lineno, matched_word, excerpt) in hits:
+                project_comment_rows.append([pid, full, ref, path, lineno, matched_word, excerpt])
 
         # 扫描commit历史
         commits = get_commits(pid, ref)
