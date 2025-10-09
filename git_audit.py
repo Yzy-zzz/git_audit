@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
-# 两个功能：
+# 三个功能：
 # 1. 扫描 GitLab 上的所有项目，找出提交的二进制文件（如 .zip, .doc 等）
 # 2. 扫描代码注释，找出包含敏感词的注释行（如密码、密钥等）
+# 3. 扫描每个项目的commit历史信息，找出包含敏感词的提交记录
 
 # 可配置项：
 # - GITLAB_URL: GitLab 实例地址，如 https://gitlab.com 或 http://10.26.31.128:80
@@ -177,6 +178,46 @@ def scan_comment_lines(ext: str, text: str) -> List[Tuple[int, str]]:
 
     return hits
 
+def get_commits(proj_id: int, ref: str = None) -> List[Dict]:
+    """获取项目的commit历史"""
+    commits = []
+    page = 1
+    params = {"per_page": 100, "page": page}
+    if ref:
+        params["ref_name"] = ref
+    
+    try:
+        while True:
+            r = get(f"{BASE}/api/v4/projects/{proj_id}/repository/commits", params=params)
+            items = r.json()
+            if not items:
+                break
+            commits.extend(items)
+            page += 1
+            params["page"] = page
+            # 限制获取的commit数量，避免API超时
+            if len(commits) >= 1000:
+                break
+    except Exception as e:
+        print(f"    [警告] 获取commit历史失败: {e}")
+    
+    return commits
+
+def scan_commit_message(message: str) -> List[str]:
+    """扫描commit message中的敏感词"""
+    hits = []
+    if not message:
+        return hits
+    
+    for pat in WORD_PATTERNS:
+        if pat.search(message):
+            # 找到匹配的具体词
+            matched = next((w for w in WORDS if re.search(re.escape(w), message, re.IGNORECASE)), "")
+            if matched:
+                hits.append(matched)
+    
+    return list(set(hits))  # 去重
+
 def init_csv_files():
     """初始化CSV文件，写入表头"""
     # 初始化二进制文件CSV
@@ -188,6 +229,11 @@ def init_csv_files():
     with open("comment_hits.csv", "w", newline="", encoding="utf-8") as f:
         cw = csv.writer(f)
         cw.writerow(["project_id","project","branch","file_path","line","keyword","comment_excerpt"])
+    
+    # 初始化commit历史敏感词CSV
+    with open("commit_hits.csv", "w", newline="", encoding="utf-8") as f:
+        cw = csv.writer(f)
+        cw.writerow(["project_id","project","commit_id","commit_message","author","date","keyword","message_excerpt"])
 
 def append_to_binary_csv(rows):
     """追加二进制文件记录到CSV"""
@@ -205,6 +251,14 @@ def append_to_comment_csv(rows):
         cw = csv.writer(f)
         cw.writerows(rows)
 
+def append_to_commit_csv(rows):
+    """追加commit历史敏感词记录到CSV"""
+    if not rows:
+        return
+    with open("commit_hits.csv", "a", newline="", encoding="utf-8") as f:
+        cw = csv.writer(f)
+        cw.writerows(rows)
+
 def main():
     # 初始化CSV文件
     init_csv_files()
@@ -217,6 +271,7 @@ def main():
     
     total_binary_hits = 0
     total_comment_hits = 0
+    total_commit_hits = 0
     
     # 逐个处理项目并显示进度
     for idx, p in enumerate(projects, 1):
@@ -247,6 +302,7 @@ def main():
         # 当前项目的记录
         project_bin_rows = []
         project_comment_rows = []
+        project_commit_rows = []
 
         for node in tree:
             if node.get("type") != "blob":
@@ -283,16 +339,35 @@ def main():
                 matched = next((w for w in WORDS if re.search(re.escape(w), excerpt, re.IGNORECASE)), "")
                 project_comment_rows.append([pid, full, ref, path, lineno, matched, excerpt])
 
+        # 扫描commit历史
+        commits = get_commits(pid, ref)
+        for commit in commits:
+            commit_id = commit.get("id", "")
+            commit_message = commit.get("message", "")
+            author_name = commit.get("author_name", "")
+            commit_date = commit.get("created_at", "")
+            
+            sensitive_words = scan_commit_message(commit_message)
+            for keyword in sensitive_words:
+                # 截取commit message片段，避免CSV过长
+                message_excerpt = commit_message.replace('\n', ' ').replace('\r', ' ')[:200]
+                project_commit_rows.append([
+                    pid, full, commit_id[:8], message_excerpt, 
+                    author_name, commit_date, keyword, commit_message[:240]
+                ])
+
         # 每处理完一个项目就写入CSV
         append_to_binary_csv(project_bin_rows)
         append_to_comment_csv(project_comment_rows)
+        append_to_commit_csv(project_commit_rows)
         
         # 更新统计并显示当前项目结果
         total_binary_hits += len(project_bin_rows)
         total_comment_hits += len(project_comment_rows)
+        total_commit_hits += len(project_commit_rows)
         
-        if project_bin_rows or project_comment_rows:
-            print(f"  -> 发现: 二进制文件 {len(project_bin_rows)} 个, 敏感注释 {len(project_comment_rows)} 条")
+        if project_bin_rows or project_comment_rows or project_commit_rows:
+            print(f"  -> 发现: 二进制文件 {len(project_bin_rows)} 个, 敏感注释 {len(project_comment_rows)} 条, 敏感commit {len(project_commit_rows)} 条")
         else:
             print(f"  -> 无发现")
         
@@ -302,7 +377,8 @@ def main():
     print(f"\n扫描完成！")
     print(f"总计发现二进制文件：{total_binary_hits} 条")
     print(f"总计发现注释敏感词：{total_comment_hits} 条")
-    print("结果文件：binary_hits.csv, comment_hits.csv")
+    print(f"总计发现commit敏感词：{total_commit_hits} 条")
+    print("结果文件：binary_hits.csv, comment_hits.csv, commit_hits.csv")
 
 if __name__ == "__main__":
     main()
