@@ -35,7 +35,7 @@ def parse_sensitive_words():
     if raw_words.strip():
         words = [w.strip() for w in raw_words.split(",") if w.strip()]
     else:
-        words = ["secret","password",
+        words = ["secret","password","regex:\\bGK\\b"
                  "access_key","api_key","client_secret","credential","confidential","regex:.*ok.*"]
     
     patterns = []
@@ -46,7 +46,7 @@ def parse_sensitive_words():
             # 正则表达式模式
             regex_pattern = word[6:]  # 去掉 "regex:" 前缀
             try:
-                patterns.append(re.compile(regex_pattern, re.IGNORECASE))
+                patterns.append(re.compile(regex_pattern, re.IGNORECASE | re.ASCII))
                 word_list.append(f"regex:{regex_pattern}")
             except re.error as e:
                 print(f"警告：无效的正则表达式 '{regex_pattern}': {e}", file=sys.stderr)
