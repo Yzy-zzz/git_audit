@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
-import os, csv, re, sys, subprocess, json
-from typing import List, Dict, Tuple
+import os, csv, re, sys, subprocess, json, tempfile
+from typing import Any, List, Dict, Tuple
 
 # === 敏感词和扩展名配置（与你原来的保持一致） ===
 def parse_sensitive_words():
@@ -43,36 +43,76 @@ SKIP_DIRS = {".git","node_modules","vendor","dist","build",".next",".venv","venv
 MAX_BYTES = 1_000_000
 
 # === 核心替换：使用 gitlab-rails 获取项目物理路径 ===
-def get_project_mappings() -> List[Dict]:
+def get_project_mappings() -> Tuple[List[Dict], Dict[str, str]]:
     print("正在从 GitLab 数据库提取项目物理路径（启动 Rails 环境可能需要 15-30 秒）...")
     # 这段 Ruby 代码将在 GitLab 环境内执行，直接读取数据库并返回 JSON
     ruby_script = """
-    require 'json'
-    projects = Project.where.not(pending_delete: true).map do |p|
-      next if p.empty_repo?
-      {
-        id: p.id,
-        name: p.full_path,
-        branch: p.default_branch || 'master',
-        repo_path: p.repository.path_to_repo
-      }
-    end.compact
-    puts "===JSON_START==="
-    puts projects.to_json
-    puts "===JSON_END==="
+      require 'json'
+      storages = { "default" => "/var/opt/gitlab/git-data/repositories" }
+
+      projects = Project.where.not(pending_delete: true).map do |p|
+        {
+          id: p.id,
+          name: p.full_path,
+          branch: p.default_branch || 'master',
+          storage: p.repository_storage,
+          disk_path: p.disk_path,        # 数据库直读，无权限检查
+          legacy_disk_path: p.try(:legacy_disk_path)
+        }
+      end
+
+      payload = { storages: storages, projects: projects }
+      puts "===JSON_START==="
+      puts payload.to_json
+      puts "===JSON_END==="
     """
     
-    cmd = ['gitlab-rails', 'runner', ruby_script]
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-    
-    if result.returncode != 0:
-        print(f"获取路径失败:\n{result.stderr}", file=sys.stderr)
-        sys.exit(1)
+    tmp_rb = None
+    try:
+        tmp_dir = os.environ.get("GITLAB_RUNNER_TMP_DIR", "/var/tmp")
+        with tempfile.NamedTemporaryFile("w", suffix=".rb", delete=False, dir=tmp_dir) as f:
+            f.write(ruby_script)
+            tmp_rb = f.name
+        os.chmod(tmp_rb, 0o644)
+
+        commands = [
+            ['sudo', '-u', 'git', '-H', 'gitlab-rails', 'runner', tmp_rb],
+            ['gitlab-rails', 'runner', tmp_rb],
+        ]
+
+        result = None
+        last_err = ""
+        for cmd in commands:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                )
+            except FileNotFoundError as e:
+                last_err = str(e)
+                continue
+
+            if result.returncode == 0:
+                break
+
+            last_err = (result.stderr or result.stdout or "").strip()
+
+        if result is None or result.returncode != 0:
+            print(
+                "获取路径失败：gitlab-rails runner 执行失败。\n"
+                "建议先验证：sudo -u git -H gitlab-rails runner \"puts 'OK'\"\n"
+                f"最后错误：{last_err}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    finally:
+        if tmp_rb and os.path.exists(tmp_rb):
+            try:
+                os.remove(tmp_rb)
+            except OSError:
+                pass
 
     # 解析输出中的 JSON
     json_str = ""
@@ -86,7 +126,47 @@ def get_project_mappings() -> List[Dict]:
         if in_json:
             json_str += line
             
-    return json.loads(json_str)
+    if not json_str.strip():
+        print(
+            "获取路径失败：runner 未返回 JSON 数据，请检查 GitLab 版本与 Ruby 脚本字段兼容性。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    payload = json.loads(json_str)
+    projects = payload.get("projects", [])
+    storage_roots = payload.get("storages", {})
+    return projects, storage_roots
+
+def build_repo_path(project: Dict[str, Any], storage_roots: Dict[str, str]) -> str:
+    """根据 storage + disk_path 组合仓库物理路径，兼容旧字段。"""
+    candidates: List[str] = []
+
+    storage = project.get("storage")
+    disk_path = (project.get("disk_path") or "").lstrip("/\\")
+    legacy_disk_path = (project.get("legacy_disk_path") or "").lstrip("/\\")
+
+    if storage and storage_roots.get(storage):
+        base = storage_roots[storage]
+        if disk_path:
+            candidates.append(os.path.join(base, disk_path))
+            if not disk_path.endswith(".git"):
+                candidates.append(os.path.join(base, f"{disk_path}.git"))
+        if legacy_disk_path:
+            candidates.append(os.path.join(base, legacy_disk_path))
+            if not legacy_disk_path.endswith(".git"):
+                candidates.append(os.path.join(base, f"{legacy_disk_path}.git"))
+
+    # 兼容旧版字段（如果未来脚本被复用）
+    repo_path = project.get("repo_path")
+    if repo_path:
+        candidates.append(repo_path)
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    return candidates[0] if candidates else ""
 
 # === 本地 Git 命令封装 ===
 def ext_of(path: str) -> str:
@@ -230,7 +310,7 @@ def append_to_csv(filename, rows):
 def main():
     init_csv_files()
     
-    projects = get_project_mappings()
+    projects, storage_roots = get_project_mappings()
     total_projects = len(projects)
     print(f"成功获取 {total_projects} 个非空项目的物理路径，开始本地极速扫描...")
     
@@ -242,13 +322,15 @@ def main():
         pid = p["id"]
         full = p["name"]
         ref = p["branch"]
-        repo_path = p["repo_path"]
+        repo_path = build_repo_path(p, storage_roots)
         
         print(f"[{idx}/{total_projects}] 正在扫描项目: {full}")
         
         # 物理路径可能不存在（例如尚未初始化的裸库）
-        if not os.path.exists(repo_path):
-            print(f"  [跳过] 找不到物理路径: {repo_path}")
+        if not repo_path or not os.path.exists(repo_path):
+            storage = p.get("storage", "unknown")
+            disk_path = p.get("disk_path") or p.get("legacy_disk_path") or ""
+            print(f"  [跳过] 找不到物理路径: storage={storage}, disk_path={disk_path}")
             continue
 
         project_bin_rows, project_comment_rows, project_commit_rows = [], [], []
