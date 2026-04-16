@@ -157,13 +157,27 @@
    sudo chmod +x /var/opt/gitlab/gitaly/custom_hooks/pre-receive.d/policy-checks
    ```
 
-5. **应用配置**
+5. **重要：在 Linux 服务器上强制转换为 LF（避免 `exit status 127`）**
+
+  > 若脚本在 Windows 编辑/复制过，可能带有 `CRLF`。Linux 读取 shebang 时会把 `\r` 带入，导致找不到解释器（常见报错：`exit status 127`）。
+
+  ```bash
+  sudo sed -i 's/\r$//' /var/opt/gitlab/gitaly/custom_hooks/pre-receive.d/policy-checks
+  ```
+
+  （可选检查：若输出包含 `CRLF`，说明仍需转换）
+
+  ```bash
+  file /var/opt/gitlab/gitaly/custom_hooks/pre-receive.d/policy-checks
+  ```
+
+6. **应用配置**
 
    ```bash
    sudo gitlab-ctl reconfigure
    ```
 
-6. **（可选）集中化策略文件**  
+7. **（可选）集中化策略文件**  
    若你想不用改脚本就能调整规则，新建目录并按需填入三类可选配置：
 
    ```bash

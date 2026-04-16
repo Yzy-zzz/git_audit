@@ -53,6 +53,15 @@ grep_sensitive() {
   fi
 }
 
+list_new_commits() {
+  local oldrev="$1" newrev="$2"
+  if [[ "$oldrev" =~ ^0{40}$ ]]; then
+    git rev-list --no-merges "$newrev" --not --all
+  else
+    git rev-list --no-merges "${oldrev}..${newrev}"
+  fi
+}
+
 check_commit_message() {
   local commit="$1" msg
   msg="$(git log -1 --pretty=%B "$commit")" || return 0
@@ -72,7 +81,7 @@ scan_added_comment_lines() {
   local commit="$1" path="$2"
   # 仅看“新增的行”，并过滤出“看起来是注释的新增行”
   # 排除 diff 头部的 '+++'
-  if git diff -U0 "${commit}^" "$commit" -- "$path" \
+  if git show --pretty=format: --unified=0 "$commit" -- "$path" \
       | grep -E '^\+[^+]' \
       | grep -E "$COMMENT_PREFIX_REGEX" \
       | sed -E 's/^\+//' \
@@ -114,7 +123,7 @@ while read -r oldrev newrev refname; do
   # 遍历此次 push 引入的所有非合并提交
   while read -r commit; do
     check_commit "$commit" "$DENY_EXT_REGEX"
-  done < <(git rev-list --no-merges "${oldrev}..${newrev}")
+  done < <(list_new_commits "$oldrev" "$newrev")
 done
 
 exit 0
