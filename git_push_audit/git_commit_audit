@@ -90,24 +90,59 @@ deny_extensions() {
 scan_added_comment_lines() {
   local commit="$1" path="$2"
   local line new_line_no="" content hit
+  local in_block_comment=0
 
-  # 逐行解析 unified=0 diff，定位新增行在“新文件”中的实际行号
+  # 逐行解析 unified=3 diff，定位新增行在“新文件”中的实际行号，并支持简单的多行和行尾注释状态
   while IFS= read -r line; do
     if [[ "$line" =~ ^@@[[:space:]]-[0-9]+(,[0-9]+)?[[:space:]]\+([0-9]+)(,[0-9]+)?[[:space:]]@@ ]]; then
       new_line_no="${BASH_REMATCH[2]}"
+      in_block_comment=0 # 每个 hunk 重置状态
       continue
     fi
 
     # 跳过文件头
-    if [[ "$line" =~ ^\+\+\+ ]]; then
+    if [[ "$line" =~ ^(---|\+\+\+) ]]; then
       continue
     fi
 
-    # 新增行（排除 '+++' 头）
-    if [[ "$line" =~ ^\+[^+] ]]; then
-      if printf '%s\n' "$line" | grep -E "$COMMENT_PREFIX_REGEX" >/dev/null; then
-        content="${line#+}"
-        hit="$(printf '%s\n' "$content" | sensitive_match_first || true)"
+    # 提取内容部分（去掉第一列的前缀 '+', '-', ' '）
+    content="${line:1}"
+    local is_comment=0
+    local target_text=""
+
+    # 状态机：处理多行注释和单行/行尾注释
+    if (( in_block_comment == 1 )); then
+      is_comment=1
+      target_text="$content"
+      # A. 检查块注释是否闭合
+      if [[ "$content" =~ \*/ ]] || [[ "$content" =~ \"\"\" ]] || [[ "$content" =~ \'\'\' ]]; then
+        in_block_comment=0
+      fi
+    else
+      # B. 检查是否开启块注释
+      if [[ "$content" =~ /\* ]] || [[ "$content" =~ \"\"\" ]] || [[ "$content" =~ \'\'\' ]]; then
+        in_block_comment=1
+        is_comment=1
+        target_text="$content"
+        # 检查是否在同一行就闭合了
+        if [[ "$content" =~ /\*.*\*/ ]] || [[ "$content" =~ \"\"\".*\"\"\" ]] || [[ "$content" =~ \'\'\'.*\'\'\' ]]; then
+          in_block_comment=0
+        fi
+      # C. 匹配行首或行中（如代码后的）行尾注释：#, //, --, ; 等
+      elif [[ "$content" =~ (^|[[:space:]])(#|//|--|;)(.*) ]]; then
+        is_comment=1
+        target_text="${BASH_REMATCH[3]}" # 仅提取注释内容去匹配敏感词
+      # D. 匹配 Javadoc/多行注释中间常见的前导星号
+      elif [[ "$content" =~ ^[[:space:]]*\* ]]; then
+        is_comment=1
+        target_text="$content"
+      fi
+    fi
+
+    # 触发检查：只拦截“新增”的行（且确保以+开头，容错处理）
+    if [[ "$line" =~ ^\+[^+]? ]]; then
+      if (( is_comment == 1 )) && [[ -n "$target_text" ]]; then
+        hit="$(printf '%s\n' "$target_text" | sensitive_match_first || true)"
         if [[ -n "$hit" ]]; then
           die "Sensitive keyword found in comment: keyword='$hit', location=${path}:${new_line_no:-?}, commit=$commit, line='${content}'"
         fi
@@ -115,8 +150,13 @@ scan_added_comment_lines() {
       if [[ -n "$new_line_no" ]]; then
         new_line_no=$((new_line_no + 1))
       fi
+    elif [[ "$line" =~ ^[[:space:]] ]]; then
+      # 对于上下文不变的行，只用来维护状态机和行号
+      if [[ -n "$new_line_no" ]]; then
+        new_line_no=$((new_line_no + 1))
+      fi
     fi
-  done < <(git show --pretty=format: --unified=0 "$commit" -- "$path")
+  done < <(git show --pretty=format: --unified=3 "$commit" -- "$path")
 }
 
 check_commit() {
