@@ -53,6 +53,15 @@ grep_sensitive() {
   fi
 }
 
+sensitive_match_first() {
+  # 提取首个命中的敏感词，用于错误提示
+  if [[ -s "$KEYWORDS_FILE" ]]; then
+    grep -Eio -m 1 -f "$KEYWORDS_FILE"
+  else
+    grep -Eio -m 1 "$DEFAULT_SENSITIVE_PATTERN"
+  fi
+}
+
 list_new_commits() {
   local oldrev="$1" newrev="$2"
   if [[ "$oldrev" =~ ^0{40}$ ]]; then
@@ -63,31 +72,51 @@ list_new_commits() {
 }
 
 check_commit_message() {
-  local commit="$1" msg
+  local commit="$1" msg hit
   msg="$(git log -1 --pretty=%B "$commit")" || return 0
-  if printf '%s' "$msg" | grep_sensitive >/dev/null; then
-    die "提交信息包含敏感词（commit: $commit）"
+  hit="$(printf '%s' "$msg" | sensitive_match_first || true)"
+  if [[ -n "$hit" ]]; then
+    die "Sensitive keyword found in commit message: keyword='$hit', location=commit message, commit=$commit"
   fi
 }
 
 deny_extensions() {
   local path="$1" regex="$2"
   if echo "$path" | grep -Eq "$regex"; then
-    die "禁止提交此类文件：$path"
+    die "Forbidden file type detected: $path"
   fi
 }
 
 scan_added_comment_lines() {
   local commit="$1" path="$2"
-  # 仅看“新增的行”，并过滤出“看起来是注释的新增行”
-  # 排除 diff 头部的 '+++'
-  if git show --pretty=format: --unified=0 "$commit" -- "$path" \
-      | grep -E '^\+[^+]' \
-      | grep -E "$COMMENT_PREFIX_REGEX" \
-      | sed -E 's/^\+//' \
-      | grep_sensitive >/dev/null; then
-    die "在注释中发现敏感词：$path @ $commit"
-  fi
+  local line new_line_no="" content hit
+
+  # 逐行解析 unified=0 diff，定位新增行在“新文件”中的实际行号
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^@@[[:space:]]-[0-9]+(,[0-9]+)?[[:space:]]\+([0-9]+)(,[0-9]+)?[[:space:]]@@ ]]; then
+      new_line_no="${BASH_REMATCH[2]}"
+      continue
+    fi
+
+    # 跳过文件头
+    if [[ "$line" =~ ^\+\+\+ ]]; then
+      continue
+    fi
+
+    # 新增行（排除 '+++' 头）
+    if [[ "$line" =~ ^\+[^+] ]]; then
+      if printf '%s\n' "$line" | grep -E "$COMMENT_PREFIX_REGEX" >/dev/null; then
+        content="${line#+}"
+        hit="$(printf '%s\n' "$content" | sensitive_match_first || true)"
+        if [[ -n "$hit" ]]; then
+          die "Sensitive keyword found in comment: keyword='$hit', location=${path}:${new_line_no:-?}, commit=$commit, line='${content}'"
+        fi
+      fi
+      if [[ -n "$new_line_no" ]]; then
+        new_line_no=$((new_line_no + 1))
+      fi
+    fi
+  done < <(git show --pretty=format: --unified=0 "$commit" -- "$path")
 }
 
 check_commit() {
